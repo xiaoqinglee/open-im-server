@@ -20,6 +20,7 @@ import (
 	"time"
 
 	relationtb "github.com/openimsdk/open-im-server/v3/pkg/common/storage/model"
+	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
 
 	"github.com/openimsdk/open-im-server/v3/pkg/authverify"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/servererrs"
@@ -50,14 +51,14 @@ func (t *thirdServer) UploadLogs(ctx context.Context, req *third.UploadLogsReq) 
 	platform := constant.PlatformID2Name[int(req.Platform)]
 	for _, fileURL := range req.FileURLs {
 		log := relationtb.Log{
-			Platform:   platform,
-			UserID:     userID,
-			CreateTime: time.Now(),
-			Url:        fileURL.URL,
-			FileName:   fileURL.Filename,
-			SystemType: req.AppFramework,
-			Version:    req.Version,
-			Ex:         req.Ex,
+			Platform:     platform,
+			UserID:       userID,
+			CreateTime:   time.Now(),
+			Url:          fileURL.URL,
+			FileName:     fileURL.Filename,
+			AppFramework: req.AppFramework,
+			Version:      req.Version,
+			Ex:           req.Ex,
 		}
 		for i := 0; i < 20; i++ {
 			id := genLogID()
@@ -149,7 +150,7 @@ func (t *thirdServer) SearchLogs(ctx context.Context, req *third.SearchLogsReq) 
 	for _, log := range logs {
 		userIDs = append(userIDs, log.UserID)
 	}
-	userMap, err := t.userRpcClient.GetUsersInfoMap(ctx, userIDs)
+	userMap, err := rpcclient.GetUsersInfoMap(ctx, userIDs)
 	if err != nil {
 		return nil, err
 	}

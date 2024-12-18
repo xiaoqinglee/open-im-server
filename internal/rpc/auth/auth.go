@@ -42,7 +42,6 @@ import (
 type authServer struct {
 	pbauth.UnimplementedAuthServer
 	authDatabase   controller.AuthDatabase
-	userRpcClient  *rpcclient.UserRpcClient
 	RegisterCenter discovery.SvcDiscoveryRegistry
 	config         *Config
 }
@@ -59,9 +58,7 @@ func Start(ctx context.Context, config *Config, client discovery.SvcDiscoveryReg
 	if err != nil {
 		return err
 	}
-	userRpcClient := rpcclient.NewUserRpcClient(client, config.Discovery.RpcService.User, config.Share.IMAdminUserID)
 	pbauth.RegisterAuthServer(server, &authServer{
-		userRpcClient:  &userRpcClient,
 		RegisterCenter: client,
 		authDatabase: controller.NewAuthDatabase(
 			redis2.NewTokenCacheModel(rdb, config.RpcConfig.TokenPolicy.Expire),
@@ -86,7 +83,7 @@ func (s *authServer) GetAdminToken(ctx context.Context, req *pbauth.GetAdminToke
 
 	}
 
-	if _, err := s.userRpcClient.GetUserInfo(ctx, req.UserID); err != nil {
+	if _, err := rpcclient.GetUserInfo(ctx, req.UserID); err != nil {
 		return nil, err
 	}
 
@@ -115,7 +112,7 @@ func (s *authServer) GetUserToken(ctx context.Context, req *pbauth.GetUserTokenR
 	if authverify.IsManagerUserID(req.UserID, s.config.Share.IMAdminUserID) {
 		return nil, errs.ErrNoPermission.WrapMsg("don't get Admin token")
 	}
-	if _, err := s.userRpcClient.GetUserInfo(ctx, req.UserID); err != nil {
+	if _, err := rpcclient.GetUserInfo(ctx, req.UserID); err != nil {
 		return nil, err
 	}
 	token, err := s.authDatabase.CreateToken(ctx, req.UserID, int(req.PlatformID))
@@ -130,7 +127,7 @@ func (s *authServer) GetUserToken(ctx context.Context, req *pbauth.GetUserTokenR
 func (s *authServer) parseToken(ctx context.Context, tokensString string) (claims *tokenverify.Claims, err error) {
 	claims, err = tokenverify.GetClaimFromToken(tokensString, authverify.Secret(s.config.Share.Secret))
 	if err != nil {
-		return nil, errs.Wrap(err)
+		return nil, err
 	}
 	isAdmin := authverify.IsManagerUserID(claims.UserID, s.config.Share.IMAdminUserID)
 	if isAdmin {

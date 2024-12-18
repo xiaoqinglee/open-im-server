@@ -18,11 +18,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/openimsdk/tools/s3/aws"
-
 	"github.com/openimsdk/tools/db/mongoutil"
 	"github.com/openimsdk/tools/db/redisutil"
 	"github.com/openimsdk/tools/mq/kafka"
+	"github.com/openimsdk/tools/s3/aws"
 	"github.com/openimsdk/tools/s3/cos"
 	"github.com/openimsdk/tools/s3/kodo"
 	"github.com/openimsdk/tools/s3/minio"
@@ -108,9 +107,10 @@ type API struct {
 		CompressionLevel int    `mapstructure:"compressionLevel"`
 	} `mapstructure:"api"`
 	Prometheus struct {
-		Enable     bool   `mapstructure:"enable"`
-		Ports      []int  `mapstructure:"ports"`
-		GrafanaURL string `mapstructure:"grafanaURL"`
+		Enable       bool   `mapstructure:"enable"`
+		AutoSetPorts bool   `mapstructure:"autoSetPorts"`
+		Ports        []int  `mapstructure:"ports"`
+		GrafanaURL   string `mapstructure:"grafanaURL"`
 	} `mapstructure:"prometheus"`
 }
 
@@ -193,7 +193,11 @@ type MsgGateway struct {
 }
 
 type MsgTransfer struct {
-	Prometheus Prometheus `mapstructure:"prometheus"`
+	Prometheus struct {
+		Enable       bool  `mapstructure:"enable"`
+		AutoSetPorts bool  `mapstructure:"autoSetPorts"`
+		Ports        []int `mapstructure:"ports"`
+	} `mapstructure:"prometheus"`
 }
 
 type Push struct {
@@ -605,4 +609,73 @@ func (l *CacheConfig) Success() time.Duration {
 
 func (l *CacheConfig) Enable() bool {
 	return l.Topic != "" && l.SlotNum > 0 && l.SlotSize > 0
+}
+
+func InitNotification(notification *Notification) {
+	notification.GroupCreated.UnreadCount = false
+	notification.GroupCreated.ReliabilityLevel = 1
+	notification.GroupInfoSet.UnreadCount = false
+	notification.GroupInfoSet.ReliabilityLevel = 1
+	notification.JoinGroupApplication.UnreadCount = false
+	notification.JoinGroupApplication.ReliabilityLevel = 1
+	notification.MemberQuit.UnreadCount = false
+	notification.MemberQuit.ReliabilityLevel = 1
+	notification.GroupApplicationAccepted.UnreadCount = false
+	notification.GroupApplicationAccepted.ReliabilityLevel = 1
+	notification.GroupApplicationRejected.UnreadCount = false
+	notification.GroupApplicationRejected.ReliabilityLevel = 1
+	notification.GroupOwnerTransferred.UnreadCount = false
+	notification.GroupOwnerTransferred.ReliabilityLevel = 1
+	notification.MemberKicked.UnreadCount = false
+	notification.MemberKicked.ReliabilityLevel = 1
+	notification.MemberInvited.UnreadCount = false
+	notification.MemberInvited.ReliabilityLevel = 1
+	notification.MemberEnter.UnreadCount = false
+	notification.MemberEnter.ReliabilityLevel = 1
+	notification.GroupDismissed.UnreadCount = false
+	notification.GroupDismissed.ReliabilityLevel = 1
+	notification.GroupMuted.UnreadCount = false
+	notification.GroupMuted.ReliabilityLevel = 1
+	notification.GroupCancelMuted.UnreadCount = false
+	notification.GroupCancelMuted.ReliabilityLevel = 1
+	notification.GroupMemberMuted.UnreadCount = false
+	notification.GroupMemberMuted.ReliabilityLevel = 1
+	notification.GroupMemberCancelMuted.UnreadCount = false
+	notification.GroupMemberCancelMuted.ReliabilityLevel = 1
+	notification.GroupMemberInfoSet.UnreadCount = false
+	notification.GroupMemberInfoSet.ReliabilityLevel = 1
+	notification.GroupMemberSetToAdmin.UnreadCount = false
+	notification.GroupMemberSetToAdmin.ReliabilityLevel = 1
+	notification.GroupMemberSetToOrdinary.UnreadCount = false
+	notification.GroupMemberSetToOrdinary.ReliabilityLevel = 1
+	notification.GroupInfoSetAnnouncement.UnreadCount = false
+	notification.GroupInfoSetAnnouncement.ReliabilityLevel = 1
+	notification.GroupInfoSetName.UnreadCount = false
+	notification.GroupInfoSetName.ReliabilityLevel = 1
+	notification.FriendApplicationAdded.UnreadCount = false
+	notification.FriendApplicationAdded.ReliabilityLevel = 1
+	notification.FriendApplicationApproved.UnreadCount = false
+	notification.FriendApplicationApproved.ReliabilityLevel = 1
+	notification.FriendApplicationRejected.UnreadCount = false
+	notification.FriendApplicationRejected.ReliabilityLevel = 1
+	notification.FriendAdded.UnreadCount = false
+	notification.FriendAdded.ReliabilityLevel = 1
+	notification.FriendDeleted.UnreadCount = false
+	notification.FriendDeleted.ReliabilityLevel = 1
+	notification.FriendRemarkSet.UnreadCount = false
+	notification.FriendRemarkSet.ReliabilityLevel = 1
+	notification.BlackAdded.UnreadCount = false
+	notification.BlackAdded.ReliabilityLevel = 1
+	notification.BlackDeleted.UnreadCount = false
+	notification.BlackDeleted.ReliabilityLevel = 1
+	notification.FriendInfoUpdated.UnreadCount = false
+	notification.FriendInfoUpdated.ReliabilityLevel = 1
+	notification.UserInfoUpdated.UnreadCount = false
+	notification.UserInfoUpdated.ReliabilityLevel = 1
+	notification.UserStatusChanged.UnreadCount = false
+	notification.UserStatusChanged.ReliabilityLevel = 1
+	notification.ConversationChanged.UnreadCount = false
+	notification.ConversationChanged.ReliabilityLevel = 1
+	notification.ConversationSetPrivate.UnreadCount = false
+	notification.ConversationSetPrivate.ReliabilityLevel = 1
 }
