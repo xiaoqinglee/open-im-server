@@ -41,7 +41,7 @@ type Config struct {
 func Start(ctx context.Context, index int, conf *Config) error {
 	conf.RuntimeEnv = runtimeenv.PrintRuntimeEnvironment()
 
-	log.CInfo(ctx, "MSG-GATEWAY server is initializing", "runtimeEnv", conf.RuntimeEnv, "autoSetPorts", conf.MsgGateway.RPC.AutoSetPorts,
+	log.CInfo(ctx, "MSG-GATEWAY server is initializing", "runtimeEnv", conf.RuntimeEnv,
 		"rpcPorts", conf.MsgGateway.RPC.Ports,
 		"wsPort", conf.MsgGateway.LongConnSvr.Ports, "prometheusPorts", conf.MsgGateway.Prometheus.Ports)
 	wsPort, err := datautil.GetElemByIndex(conf.MsgGateway.LongConnSvr.Ports, index)
@@ -62,7 +62,7 @@ func Start(ctx context.Context, index int, conf *Config) error {
 	)
 
 	hubServer := NewServer(longServer, conf, func(srv *Server) error {
-		longServer.online, _ = rpccache.NewOnlineCache(srv.userRcp, nil, rdb, false, longServer.subscriberUserOnlineStatusChanges)
+		longServer.online, _ = rpccache.NewOnlineCache(conf.Share.IMAdminUserID, nil, rdb, false, longServer.subscriberUserOnlineStatusChanges)
 		return nil
 	})
 

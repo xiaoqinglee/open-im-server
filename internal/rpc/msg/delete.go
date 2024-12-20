@@ -21,6 +21,7 @@ import (
 	"github.com/openimsdk/protocol/constant"
 	"github.com/openimsdk/protocol/conversation"
 	"github.com/openimsdk/protocol/msg"
+	"github.com/openimsdk/protocol/rpccall"
 	"github.com/openimsdk/protocol/sdkws"
 	"github.com/openimsdk/tools/log"
 	"github.com/openimsdk/tools/utils/timeutil"
@@ -74,7 +75,10 @@ func (m *msgServer) DeleteMsgs(ctx context.Context, req *msg.DeleteMsgsReq) (*ms
 		if err := m.MsgDatabase.DeleteMsgsPhysicalBySeqs(ctx, req.ConversationID, req.Seqs); err != nil {
 			return nil, err
 		}
-		conversations, err := m.Conversation.GetConversationsByConversationID(ctx, []string{req.ConversationID})
+
+		conversations, err := rpccall.ExtractField(ctx, conversation.GetConversationsByConversationIDCaller.Invoke, &conversation.GetConversationsByConversationIDReq{
+			ConversationIDs: []string{req.ConversationID},
+		}, (*conversation.GetConversationsByConversationIDResp).GetConversations)
 		if err != nil {
 			return nil, err
 		}
@@ -121,7 +125,9 @@ func (m *msgServer) DeleteMsgPhysical(ctx context.Context, req *msg.DeleteMsgPhy
 }
 
 func (m *msgServer) clearConversation(ctx context.Context, conversationIDs []string, userID string, deleteSyncOpt *msg.DeleteSyncOpt) error {
-	conversations, err := m.Conversation.GetConversationsByConversationID(ctx, conversationIDs)
+	conversations, err := rpccall.ExtractField(ctx, conversation.GetConversationsByConversationIDCaller.Invoke, &conversation.GetConversationsByConversationIDReq{
+		ConversationIDs: conversationIDs,
+	}, (*conversation.GetConversationsByConversationIDResp).GetConversations)
 	if err != nil {
 		return err
 	}
@@ -138,8 +144,19 @@ func (m *msgServer) clearConversation(ctx context.Context, conversationIDs []str
 	}
 	isSyncSelf, isSyncOther := m.validateDeleteSyncOpt(deleteSyncOpt)
 	if !isSyncOther {
-		if err := m.MsgDatabase.SetUserConversationsMinSeqs(ctx, userID, m.getMinSeqs(maxSeqs)); err != nil {
+		setSeqs := m.getMinSeqs(maxSeqs)
+		if err := m.MsgDatabase.SetUserConversationsMinSeqs(ctx, userID, setSeqs); err != nil {
 			return err
+		}
+		ownerUserIDs := []string{userID}
+		for conversationID, seq := range setSeqs {
+			if err := conversation.SetConversationMinSeqCaller.Execute(ctx, &conversation.SetConversationMinSeqReq{
+				ConversationID: conversationID,
+				OwnerUserID:    ownerUserIDs,
+				MinSeq:         seq,
+			}); err != nil {
+				return err
+			}
 		}
 		// notification 2 self
 		if isSyncSelf {

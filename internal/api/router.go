@@ -2,8 +2,11 @@ package api
 
 import (
 	"fmt"
+	"net/http"
+	"strings"
 
 	"github.com/openimsdk/open-im-server/v3/internal/api/jssdk"
+	pbAuth "github.com/openimsdk/protocol/auth"
 
 	"github.com/gin-contrib/gzip"
 
@@ -13,12 +16,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"net/http"
-	"strings"
-
 	"github.com/openimsdk/open-im-server/v3/pkg/common/prommetrics"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/servererrs"
-	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
 	"github.com/openimsdk/protocol/constant"
 	"github.com/openimsdk/tools/apiresp"
 	"github.com/openimsdk/tools/discovery"
@@ -56,15 +55,6 @@ func newGinRouter(disCov discovery.SvcDiscoveryRegistry, config *Config) *gin.En
 	if v, ok := binding.Validator.Engine().(*validator.Validate); ok {
 		_ = v.RegisterValidation("required_if", RequiredIf)
 	}
-	// init rpc client here
-	userRpc := rpcclient.NewUser(disCov, config.Discovery.RpcService.User, config.Discovery.RpcService.MessageGateway,
-		config.Share.IMAdminUserID)
-	groupRpc := rpcclient.NewGroup(disCov, config.Discovery.RpcService.Group)
-	friendRpc := rpcclient.NewFriend(disCov, config.Discovery.RpcService.Friend)
-	messageRpc := rpcclient.NewMessage(disCov, config.Discovery.RpcService.Msg)
-	conversationRpc := rpcclient.NewConversation(disCov, config.Discovery.RpcService.Conversation)
-	authRpc := rpcclient.NewAuth(disCov, config.Discovery.RpcService.Auth)
-	thirdRpc := rpcclient.NewThird(disCov, config.Discovery.RpcService.Third, config.API.Prometheus.GrafanaURL)
 	switch config.API.Api.CompressionLevel {
 	case NoCompression:
 	case DefaultCompression:
@@ -74,10 +64,11 @@ func newGinRouter(disCov discovery.SvcDiscoveryRegistry, config *Config) *gin.En
 	case BestSpeed:
 		r.Use(gzip.Gzip(gzip.BestSpeed))
 	}
-	r.Use(prommetricsGin(), gin.RecoveryWithWriter(gin.DefaultErrorWriter, mw.GinPanicErr), mw.CorsHandler(), mw.GinParseOperationID(), GinParseToken(authRpc))
-	u := NewUserApi(*userRpc)
-	m := NewMessageApi(messageRpc, userRpc, config.Share.IMAdminUserID)
-	j := jssdk.NewJSSdkApi(userRpc.Client, friendRpc.Client, groupRpc.Client, messageRpc.Client, conversationRpc.Client)
+	r.Use(prommetricsGin(), gin.RecoveryWithWriter(gin.DefaultErrorWriter, mw.GinPanicErr), mw.CorsHandler(), mw.GinParseOperationID(), GinParseToken())
+	u := NewUserApi(disCov, config.Discovery.RpcService.MessageGateway)
+	m := NewMessageApi(config.Share.IMAdminUserID)
+	j := jssdk.NewJSSdkApi()
+	pd := NewPrometheusDiscoveryApi(config, disCov)
 	userRouterGroup := r.Group("/user")
 	{
 		userRouterGroup.POST("/user_register", u.UserRegister)
@@ -107,7 +98,7 @@ func newGinRouter(disCov discovery.SvcDiscoveryRegistry, config *Config) *gin.En
 	// friend routing group
 	friendRouterGroup := r.Group("/friend")
 	{
-		f := NewFriendApi(*friendRpc)
+		f := NewFriendApi()
 		friendRouterGroup.POST("/delete_friend", f.DeleteFriend)
 		friendRouterGroup.POST("/get_friend_apply_list", f.GetFriendApplyList)
 		friendRouterGroup.POST("/get_designated_friend_apply", f.GetDesignatedFriendsApply)
@@ -130,7 +121,7 @@ func newGinRouter(disCov discovery.SvcDiscoveryRegistry, config *Config) *gin.En
 		friendRouterGroup.POST("/get_incremental_friends", f.GetIncrementalFriends)
 		friendRouterGroup.POST("/get_full_friend_user_ids", f.GetFullFriendUserIDs)
 	}
-	g := NewGroupApi(*groupRpc)
+	g := NewGroupApi()
 	groupRouterGroup := r.Group("/group")
 	{
 		groupRouterGroup.POST("/create_group", g.CreateGroup)
@@ -168,16 +159,17 @@ func newGinRouter(disCov discovery.SvcDiscoveryRegistry, config *Config) *gin.En
 	// certificate
 	authRouterGroup := r.Group("/auth")
 	{
-		a := NewAuthApi(*authRpc)
+		a := NewAuthApi()
 		authRouterGroup.POST("/get_admin_token", a.GetAdminToken)
 		authRouterGroup.POST("/get_user_token", a.GetUserToken)
 		authRouterGroup.POST("/parse_token", a.ParseToken)
 		authRouterGroup.POST("/force_logout", a.ForceLogout)
+
 	}
 	// Third service
 	thirdGroup := r.Group("/third")
 	{
-		t := NewThirdApi(*thirdRpc)
+		t := NewThirdApi(config.API.Prometheus.GrafanaURL)
 		thirdGroup.GET("/prometheus", t.GetPrometheus)
 		thirdGroup.POST("/fcm_update_token", t.FcmUpdateToken)
 		thirdGroup.POST("/set_app_badge", t.SetAppBadge)
@@ -228,7 +220,7 @@ func newGinRouter(disCov discovery.SvcDiscoveryRegistry, config *Config) *gin.En
 	// Conversation
 	conversationGroup := r.Group("/conversation")
 	{
-		c := NewConversationApi(*conversationRpc)
+		c := NewConversationApi()
 		conversationGroup.POST("/get_sorted_conversation_list", c.GetSortedConversationList)
 		conversationGroup.POST("/get_all_conversations", c.GetAllConversations)
 		conversationGroup.POST("/get_conversation", c.GetConversation)
@@ -254,10 +246,23 @@ func newGinRouter(disCov discovery.SvcDiscoveryRegistry, config *Config) *gin.En
 	jssdk.POST("/get_conversations", j.GetConversations)
 	jssdk.POST("/get_active_conversations", j.GetActiveConversations)
 
+	proDiscoveryGroup := r.Group("/prometheus_discovery", pd.Enable)
+	proDiscoveryGroup.GET("/api", pd.Api)
+	proDiscoveryGroup.GET("/user", pd.User)
+	proDiscoveryGroup.GET("/group", pd.Group)
+	proDiscoveryGroup.GET("/msg", pd.Msg)
+	proDiscoveryGroup.GET("/friend", pd.Friend)
+	proDiscoveryGroup.GET("/conversation", pd.Conversation)
+	proDiscoveryGroup.GET("/third", pd.Third)
+	proDiscoveryGroup.GET("/auth", pd.Auth)
+	proDiscoveryGroup.GET("/push", pd.Push)
+	proDiscoveryGroup.GET("/msg_gateway", pd.MessageGateway)
+	proDiscoveryGroup.GET("/msg_transfer", pd.MessageTransfer)
+
 	return r
 }
 
-func GinParseToken(authRPC *rpcclient.Auth) gin.HandlerFunc {
+func GinParseToken() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		switch c.Request.Method {
 		case http.MethodPost:
@@ -275,7 +280,7 @@ func GinParseToken(authRPC *rpcclient.Auth) gin.HandlerFunc {
 				c.Abort()
 				return
 			}
-			resp, err := authRPC.ParseToken(c, token)
+			resp, err := pbAuth.ParseTokenCaller.Invoke(c, &pbAuth.ParseTokenReq{Token: token})
 			if err != nil {
 				apiresp.GinError(c, err)
 				c.Abort()

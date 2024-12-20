@@ -18,11 +18,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"time"
 
 	"github.com/openimsdk/open-im-server/v3/pkg/common/storage/database"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/storage/model"
+
+	"github.com/redis/go-redis/v9"
+	"go.mongodb.org/mongo-driver/mongo"
 
 	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/convert"
@@ -35,8 +37,6 @@ import (
 	"github.com/openimsdk/tools/mq/kafka"
 	"github.com/openimsdk/tools/utils/datautil"
 	"github.com/openimsdk/tools/utils/timeutil"
-	"github.com/redis/go-redis/v9"
-	"go.mongodb.org/mongo-driver/mongo"
 )
 
 const (
@@ -56,6 +56,7 @@ type CommonMsgDatabase interface {
 	GetMsgBySeqs(ctx context.Context, userID string, conversationID string, seqs []int64) (minSeq int64, maxSeq int64, seqMsg []*sdkws.MsgData, err error)
 	// DeleteConversationMsgsAndSetMinSeq deletes conversation messages and resets the minimum sequence number. If `remainTime` is 0, all messages are deleted (this method does not delete Redis
 	// cache).
+	GetMessagesBySeqWithBounds(ctx context.Context, userID string, conversationID string, seqs []int64, pullOrder sdkws.PullOrder) (bool, int64, []*sdkws.MsgData, error)
 	DeleteConversationMsgsAndSetMinSeq(ctx context.Context, conversationID string, remainTime int64) error
 	// ClearUserMsgs marks messages for deletion based on clear time and returns a list of sequence numbers for marked messages.
 	ClearUserMsgs(ctx context.Context, userID string, conversationID string, clearTime int64, lastMsgClearTime time.Time) (seqs []int64, err error)
@@ -67,6 +68,7 @@ type CommonMsgDatabase interface {
 	GetMaxSeqs(ctx context.Context, conversationIDs []string) (map[string]int64, error)
 	GetMaxSeq(ctx context.Context, conversationID string) (int64, error)
 	SetMinSeqs(ctx context.Context, seqs map[string]int64) error
+	SetMinSeq(ctx context.Context, conversationID string, seq int64) error
 
 	SetUserConversationsMinSeqs(ctx context.Context, userID string, seqs map[string]int64) (err error)
 	SetHasReadSeq(ctx context.Context, userID string, conversationID string, hasReadSeq int64) error
@@ -93,13 +95,16 @@ type CommonMsgDatabase interface {
 	ConvertMsgsDocLen(ctx context.Context, conversationIDs []string)
 
 	// get Msg when destruct msg before
-	GetBeforeMsg(ctx context.Context, ts int64, docIds []string, limit int) ([]*model.MsgDocModel, error)
-	DeleteDocMsgBefore(ctx context.Context, ts int64, doc *model.MsgDocModel) ([]int, error)
+	//DeleteDocMsgBefore(ctx context.Context, ts int64, doc *model.MsgDocModel) ([]int, error)
 
-	GetDocIDs(ctx context.Context) ([]string, error)
+	GetRandBeforeMsg(ctx context.Context, ts int64, limit int) ([]*model.MsgDocModel, error)
 
 	SetUserConversationsMaxSeq(ctx context.Context, conversationID string, userID string, seq int64) error
 	SetUserConversationsMinSeq(ctx context.Context, conversationID string, userID string, seq int64) error
+
+	DeleteDoc(ctx context.Context, docID string) error
+
+	GetLastMessageSeqByTime(ctx context.Context, conversationID string, time int64) (int64, error)
 }
 
 func NewCommonMsgDatabase(msgDocModel database.Msg, msg cache.MsgCache, seqUser cache.SeqUser, seqConversation cache.SeqConversationCache, kafkaConf *config.Kafka) (CommonMsgDatabase, error) {
@@ -267,7 +272,6 @@ func (db *commonMsgDatabase) getMsgBySeqs(ctx context.Context, userID, conversat
 	}
 	return totalMsgs, nil
 }
-
 func (db *commonMsgDatabase) handlerDBMsg(ctx context.Context, cache map[int64][]*model.MsgInfoModel, userID, conversationID string, msg *model.MsgInfoModel) {
 	if msg.IsRead {
 		msg.Msg.IsRead = true
@@ -278,16 +282,53 @@ func (db *commonMsgDatabase) handlerDBMsg(ctx context.Context, cache map[int64][
 	if msg.Msg.Content == "" {
 		return
 	}
+	type MsgData struct {
+		SendID           string                 `json:"sendID"`
+		RecvID           string                 `json:"recvID"`
+		GroupID          string                 `json:"groupID"`
+		ClientMsgID      string                 `json:"clientMsgID"`
+		ServerMsgID      string                 `json:"serverMsgID"`
+		SenderPlatformID int32                  `json:"senderPlatformID"`
+		SenderNickname   string                 `json:"senderNickname"`
+		SenderFaceURL    string                 `json:"senderFaceURL"`
+		SessionType      int32                  `json:"sessionType"`
+		MsgFrom          int32                  `json:"msgFrom"`
+		ContentType      int32                  `json:"contentType"`
+		Content          string                 `json:"content"`
+		Seq              int64                  `json:"seq"`
+		SendTime         int64                  `json:"sendTime"`
+		CreateTime       int64                  `json:"createTime"`
+		Status           int32                  `json:"status"`
+		IsRead           bool                   `json:"isRead"`
+		Options          map[string]bool        `json:"options,omitempty"`
+		OfflinePushInfo  *sdkws.OfflinePushInfo `json:"offlinePushInfo"`
+		AtUserIDList     []string               `json:"atUserIDList"`
+		AttachedInfo     string                 `json:"attachedInfo"`
+		Ex               string                 `json:"ex"`
+		KeyVersion       int32                  `json:"keyVersion"`
+		DstUserIDs       []string               `json:"dstUserIDs"`
+	}
 	var quoteMsg struct {
 		Text              string          `json:"text,omitempty"`
-		QuoteMessage      *sdkws.MsgData  `json:"quoteMessage,omitempty"`
+		QuoteMessage      *MsgData        `json:"quoteMessage,omitempty"`
 		MessageEntityList json.RawMessage `json:"messageEntityList,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(msg.Msg.Content), &quoteMsg); err != nil {
 		log.ZError(ctx, "json.Unmarshal", err)
 		return
 	}
-	if quoteMsg.QuoteMessage == nil || quoteMsg.QuoteMessage.ContentType == constant.MsgRevokeNotification {
+	if quoteMsg.QuoteMessage == nil || quoteMsg.QuoteMessage.Content == "" {
+		return
+	}
+	if quoteMsg.QuoteMessage.Content == "e30=" {
+		quoteMsg.QuoteMessage.Content = "{}"
+		data, err := json.Marshal(&quoteMsg)
+		if err != nil {
+			return
+		}
+		msg.Msg.Content = string(data)
+	}
+	if quoteMsg.QuoteMessage.Seq <= 0 && quoteMsg.QuoteMessage.ContentType == constant.MsgRevokeNotification {
 		return
 	}
 	var msgs []*model.MsgInfoModel
@@ -309,9 +350,9 @@ func (db *commonMsgDatabase) handlerDBMsg(ctx context.Context, cache map[int64][
 	}
 	quoteMsg.QuoteMessage.ContentType = constant.MsgRevokeNotification
 	if len(msgs) > 0 {
-		quoteMsg.QuoteMessage.Content = []byte(msgs[0].Msg.Content)
+		quoteMsg.QuoteMessage.Content = msgs[0].Msg.Content
 	} else {
-		quoteMsg.QuoteMessage.Content = []byte("{}")
+		quoteMsg.QuoteMessage.Content = "{}"
 	}
 	data, err := json.Marshal(&quoteMsg)
 	if err != nil {
@@ -319,9 +360,9 @@ func (db *commonMsgDatabase) handlerDBMsg(ctx context.Context, cache map[int64][
 		return
 	}
 	msg.Msg.Content = string(data)
-	if _, err := db.msgDocDatabase.UpdateMsg(ctx, db.msgTable.GetDocID(conversationID, msg.Msg.Seq), db.msgTable.GetMsgIndex(msg.Msg.Seq), "msg", msg.Msg); err != nil {
-		log.ZError(ctx, "UpdateMsgContent", err)
-	}
+	//if _, err := db.msgDocDatabase.UpdateMsg(ctx, db.msgTable.GetDocID(conversationID, msg.Msg.Seq), db.msgTable.GetMsgIndex(msg.Msg.Seq), "msg", msg.Msg); err != nil {
+	//	log.ZError(ctx, "UpdateMsgContent", err)
+	//}
 }
 
 func (db *commonMsgDatabase) findMsgInfoBySeq(ctx context.Context, userID, docID string, conversationID string, seqs []int64) (totalMsgs []*model.MsgInfoModel, err error) {
@@ -517,6 +558,81 @@ func (db *commonMsgDatabase) GetMsgBySeqs(ctx context.Context, userID string, co
 	return minSeq, maxSeq, successMsgs, nil
 }
 
+func (db *commonMsgDatabase) GetMessagesBySeqWithBounds(ctx context.Context, userID string, conversationID string, seqs []int64, pullOrder sdkws.PullOrder) (bool, int64, []*sdkws.MsgData, error) {
+	var endSeq int64
+	var isEnd bool
+	userMinSeq, err := db.seqUser.GetUserMinSeq(ctx, conversationID, userID)
+	if err != nil {
+		return false, 0, nil, err
+	}
+	minSeq, err := db.seqConversation.GetMinSeq(ctx, conversationID)
+	if err != nil {
+		return false, 0, nil, err
+	}
+	maxSeq, err := db.seqConversation.GetMaxSeq(ctx, conversationID)
+	if err != nil {
+		return false, 0, nil, err
+	}
+	userMaxSeq, err := db.seqUser.GetUserMaxSeq(ctx, conversationID, userID)
+	if err != nil {
+		return false, 0, nil, err
+	}
+	if userMinSeq > minSeq {
+		minSeq = userMinSeq
+	}
+	if userMaxSeq > 0 && userMaxSeq < maxSeq {
+		maxSeq = userMaxSeq
+	}
+	newSeqs := make([]int64, 0, len(seqs))
+	for _, seq := range seqs {
+		if seq <= 0 {
+			continue
+		}
+		// The normal range and can fetch messages
+		if seq >= minSeq && seq <= maxSeq {
+			newSeqs = append(newSeqs, seq)
+			continue
+		}
+		// If the requested seq is smaller than the minimum seq and the pull order is descending (pulling older messages)
+		if seq < minSeq && pullOrder == sdkws.PullOrder_PullOrderDesc {
+			isEnd = true
+			endSeq = minSeq
+		}
+		// If the requested seq is larger than the maximum seq and the pull order is ascending (pulling newer messages)
+		if seq > maxSeq && pullOrder == sdkws.PullOrder_PullOrderAsc {
+			isEnd = true
+			endSeq = maxSeq
+		}
+	}
+	if len(newSeqs) == 0 {
+		return isEnd, endSeq, nil, nil
+	}
+	successMsgs, failedSeqs, err := db.msg.GetMessagesBySeq(ctx, conversationID, newSeqs)
+	if err != nil {
+		if !errors.Is(err, redis.Nil) {
+			log.ZWarn(ctx, "get message from redis exception", err, "failedSeqs", failedSeqs, "conversationID", conversationID)
+		}
+	}
+	log.ZDebug(ctx, "db.seq.GetMessagesBySeq", "userID", userID, "conversationID", conversationID, "seqs",
+		seqs, "len(successMsgs)", len(successMsgs), "failedSeqs", failedSeqs)
+
+	if len(failedSeqs) > 0 {
+		mongoMsgs, err := db.getMsgBySeqs(ctx, userID, conversationID, failedSeqs)
+		if err != nil {
+
+			return false, 0, nil, err
+		}
+
+		successMsgs = append(successMsgs, mongoMsgs...)
+
+		//_, err = db.msg.SetMessagesToCache(ctx, conversationID, mongoMsgs)
+		//if err != nil {
+		//	return 0, 0, nil, err
+		//}
+	}
+	return isEnd, endSeq, successMsgs, nil
+}
+
 func (db *commonMsgDatabase) DeleteConversationMsgsAndSetMinSeq(ctx context.Context, conversationID string, remainTime int64) error {
 	var delStruct delMsgRecursionStruct
 	var skip int64
@@ -693,9 +809,10 @@ func (db *commonMsgDatabase) GetMaxSeq(ctx context.Context, conversationID strin
 	return db.seqConversation.GetMaxSeq(ctx, conversationID)
 }
 
-func (db *commonMsgDatabase) SetMinSeq(ctx context.Context, conversationID string, minSeq int64) error {
-	return db.seqConversation.SetMinSeq(ctx, conversationID, minSeq)
-}
+//
+//func (db *commonMsgDatabase) SetMinSeq(ctx context.Context, conversationID string, minSeq int64) error {
+//	return db.seqConversation.SetMinSeq(ctx, conversationID, minSeq)
+//}
 
 func (db *commonMsgDatabase) SetMinSeqs(ctx context.Context, seqs map[string]int64) error {
 	return db.seqConversation.SetMinSeqs(ctx, seqs)
@@ -834,56 +951,40 @@ func (db *commonMsgDatabase) ConvertMsgsDocLen(ctx context.Context, conversation
 	db.msgDocDatabase.ConvertMsgsDocLen(ctx, conversationIDs)
 }
 
-func (db *commonMsgDatabase) GetBeforeMsg(ctx context.Context, ts int64, docIDs []string, limit int) ([]*model.MsgDocModel, error) {
-	var msgs []*model.MsgDocModel
-	for i := 0; i < len(docIDs); i += 1000 {
-		end := i + 1000
-		if end > len(docIDs) {
-			end = len(docIDs)
-		}
-
-		res, err := db.msgDocDatabase.GetBeforeMsg(ctx, ts, docIDs[i:end], limit)
-		if err != nil {
-			return nil, err
-		}
-		msgs = append(msgs, res...)
-
-		if len(msgs) >= limit {
-			return msgs[:limit], nil
-		}
-	}
-	return msgs, nil
+func (db *commonMsgDatabase) GetRandBeforeMsg(ctx context.Context, ts int64, limit int) ([]*model.MsgDocModel, error) {
+	return db.msgDocDatabase.GetRandBeforeMsg(ctx, ts, limit)
 }
 
-func (db *commonMsgDatabase) DeleteDocMsgBefore(ctx context.Context, ts int64, doc *model.MsgDocModel) ([]int, error) {
-	var notNull int
-	index := make([]int, 0, len(doc.Msg))
-	for i, message := range doc.Msg {
-		if message.Msg != nil {
-			notNull++
-			if message.Msg.SendTime < ts {
-				index = append(index, i)
-			}
-		}
-	}
-	if len(index) == 0 {
-		return index, nil
-	}
-	maxSeq := doc.Msg[index[len(index)-1]].Msg.Seq
-	conversationID := doc.DocID[:strings.LastIndex(doc.DocID, ":")]
-	if err := db.setMinSeq(ctx, conversationID, maxSeq+1); err != nil {
-		return index, err
-	}
-	if len(index) == notNull {
-		log.ZDebug(ctx, "Delete db in Doc", "DocID", doc.DocID, "index", index, "maxSeq", maxSeq)
-		return index, db.msgDocDatabase.DeleteDoc(ctx, doc.DocID)
-	} else {
-		log.ZDebug(ctx, "delete db in index", "DocID", doc.DocID, "index", index, "maxSeq", maxSeq)
-		return index, db.msgDocDatabase.DeleteMsgByIndex(ctx, doc.DocID, index)
-	}
-}
+//
+//func (db *commonMsgDatabase) DeleteDocMsgBefore(ctx context.Context, ts int64, doc *model.MsgDocModel) ([]int, error) {
+//	var notNull int
+//	index := make([]int, 0, len(doc.Msg))
+//	for i, message := range doc.Msg {
+//		if message.Msg != nil {
+//			notNull++
+//			if message.Msg.SendTime < ts {
+//				index = append(index, i)
+//			}
+//		}
+//	}
+//	if len(index) == 0 {
+//		return index, nil
+//	}
+//	maxSeq := doc.Msg[index[len(index)-1]].Msg.Seq
+//	conversationID := doc.DocID[:strings.LastIndex(doc.DocID, ":")]
+//	if err := db.SetMinSeq(ctx, conversationID, maxSeq+1); err != nil {
+//		return index, err
+//	}
+//	if len(index) == notNull {
+//		log.ZDebug(ctx, "Delete db in Doc", "DocID", doc.DocID, "index", index, "maxSeq", maxSeq)
+//		return index, db.msgDocDatabase.DeleteDoc(ctx, doc.DocID)
+//	} else {
+//		log.ZDebug(ctx, "delete db in index", "DocID", doc.DocID, "index", index, "maxSeq", maxSeq)
+//		return index, db.msgDocDatabase.DeleteMsgByIndex(ctx, doc.DocID, index)
+//	}
+//}
 
-func (db *commonMsgDatabase) setMinSeq(ctx context.Context, conversationID string, seq int64) error {
+func (db *commonMsgDatabase) SetMinSeq(ctx context.Context, conversationID string, seq int64) error {
 	dbSeq, err := db.seqConversation.GetMinSeq(ctx, conversationID)
 	if err != nil {
 		if errors.Is(errs.Unwrap(err), redis.Nil) {
@@ -897,8 +998,8 @@ func (db *commonMsgDatabase) setMinSeq(ctx context.Context, conversationID strin
 	return db.seqConversation.SetMinSeq(ctx, conversationID, seq)
 }
 
-func (db *commonMsgDatabase) GetDocIDs(ctx context.Context) ([]string, error) {
-	return db.msgDocDatabase.GetDocIDs(ctx)
+func (db *commonMsgDatabase) GetRandDocIDs(ctx context.Context, limit int) ([]string, error) {
+	return db.msgDocDatabase.GetRandDocIDs(ctx, limit)
 }
 
 func (db *commonMsgDatabase) GetCacheMaxSeqWithTime(ctx context.Context, conversationIDs []string) (map[string]database.SeqTime, error) {
@@ -912,4 +1013,12 @@ func (db *commonMsgDatabase) GetMaxSeqWithTime(ctx context.Context, conversation
 func (db *commonMsgDatabase) GetMaxSeqsWithTime(ctx context.Context, conversationIDs []string) (map[string]database.SeqTime, error) {
 	// todo: only the time in the redis cache will be taken, not the message time
 	return db.seqConversation.GetMaxSeqsWithTime(ctx, conversationIDs)
+}
+
+func (db *commonMsgDatabase) DeleteDoc(ctx context.Context, docID string) error {
+	return db.msgDocDatabase.DeleteDoc(ctx, docID)
+}
+
+func (db *commonMsgDatabase) GetLastMessageSeqByTime(ctx context.Context, conversationID string, time int64) (int64, error) {
+	return db.msgDocDatabase.GetLastMessageSeqByTime(ctx, conversationID, time)
 }

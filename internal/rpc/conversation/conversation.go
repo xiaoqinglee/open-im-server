@@ -16,8 +16,6 @@ package conversation
 
 import (
 	"context"
-	"github.com/openimsdk/open-im-server/v3/pkg/msgprocessor"
-	pbmsg "github.com/openimsdk/protocol/msg"
 	"sort"
 	"time"
 
@@ -27,6 +25,10 @@ import (
 	"github.com/openimsdk/open-im-server/v3/pkg/common/storage/model"
 	dbModel "github.com/openimsdk/open-im-server/v3/pkg/common/storage/model"
 	"github.com/openimsdk/open-im-server/v3/pkg/localcache"
+	"github.com/openimsdk/open-im-server/v3/pkg/msgprocessor"
+	pbgroup "github.com/openimsdk/protocol/group"
+	pbmsg "github.com/openimsdk/protocol/msg"
+	"github.com/openimsdk/protocol/rpccall"
 	"github.com/openimsdk/tools/db/redisutil"
 
 	"github.com/openimsdk/open-im-server/v3/pkg/common/convert"
@@ -46,9 +48,6 @@ import (
 
 type conversationServer struct {
 	pbconversation.UnimplementedConversationServer
-	msgRpcClient         *rpcclient.MessageRpcClient
-	user                 *rpcclient.UserRpcClient
-	groupRpcClient       *rpcclient.GroupRpcClient
 	conversationDatabase controller.ConversationDatabase
 
 	conversationNotificationSender *ConversationNotificationSender
@@ -78,15 +77,9 @@ func Start(ctx context.Context, config *Config, client discovery.SvcDiscoveryReg
 	if err != nil {
 		return err
 	}
-	groupRpcClient := rpcclient.NewGroupRpcClient(client, config.Discovery.RpcService.Group)
-	msgRpcClient := rpcclient.NewMessageRpcClient(client, config.Discovery.RpcService.Msg)
-	userRpcClient := rpcclient.NewUserRpcClient(client, config.Discovery.RpcService.User, config.Share.IMAdminUserID)
 	localcache.InitLocalCache(&config.LocalCacheConfig)
 	pbconversation.RegisterConversationServer(server, &conversationServer{
-		msgRpcClient:                   &msgRpcClient,
-		user:                           &userRpcClient,
-		conversationNotificationSender: NewConversationNotificationSender(&config.NotificationConfig, &msgRpcClient),
-		groupRpcClient:                 &groupRpcClient,
+		conversationNotificationSender: NewConversationNotificationSender(&config.NotificationConfig),
 		conversationDatabase: controller.NewConversationDatabase(conversationDB,
 			redis.NewConversationRedis(rdb, &config.LocalCacheConfig, redis.GetRocksCacheOptions(), conversationDB), mgocli.GetTx()),
 	})
@@ -126,12 +119,18 @@ func (c *conversationServer) GetSortedConversationList(ctx context.Context, req 
 		return nil, errs.ErrRecordNotFound.Wrap()
 	}
 
-	maxSeqs, err := c.msgRpcClient.GetMaxSeqs(ctx, conversationIDs)
+	maxSeqs, err := rpccall.ExtractField(ctx, pbmsg.GetMaxSeqsCaller.Invoke,
+		&pbmsg.GetMaxSeqsReq{ConversationIDs: conversationIDs},
+		(*pbmsg.SeqsInfoResp).GetMaxSeqs)
 	if err != nil {
 		return nil, err
 	}
 
-	chatLogs, err := c.msgRpcClient.GetMsgByConversationIDs(ctx, conversationIDs, maxSeqs)
+	chatLogs, err := rpccall.ExtractField(ctx, pbmsg.GetMsgByConversationIDsCaller.Invoke,
+		&pbmsg.GetMsgByConversationIDsReq{
+			ConversationIDs: conversationIDs,
+			MaxSeqs:         maxSeqs,
+		}, (*pbmsg.GetMsgByConversationIDsResp).GetMsgDatas)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +140,9 @@ func (c *conversationServer) GetSortedConversationList(ctx context.Context, req 
 		return nil, err
 	}
 
-	hasReadSeqs, err := c.msgRpcClient.GetHasReadSeqs(ctx, req.UserID, conversationIDs)
+	hasReadSeqs, err := rpccall.ExtractField(ctx, pbmsg.GetHasReadSeqsCaller.Invoke,
+		&pbmsg.GetHasReadSeqsReq{ConversationIDs: conversationIDs},
+		(*pbmsg.SeqsInfoResp).GetMaxSeqs)
 	if err != nil {
 		return nil, err
 	}
@@ -228,11 +229,20 @@ func (c *conversationServer) SetConversations(ctx context.Context, req *pbconver
 	if req.Conversation == nil {
 		return nil, errs.ErrArgs.WrapMsg("conversation must not be nil")
 	}
-
 	if req.Conversation.ConversationType == constant.WriteGroupChatType {
-		groupInfo, err := c.groupRpcClient.GetGroupInfo(ctx, req.Conversation.GroupID)
+		groupInfo, err := rpccall.ExtractField(ctx, pbgroup.GetGroupsInfoCaller.Invoke,
+			&pbgroup.GetGroupsInfoReq{GroupIDs: []string{req.Conversation.GroupID}},
+			func(r *pbgroup.GetGroupsInfoResp) *sdkws.GroupInfo {
+				if len(r.GroupInfos) > 0 {
+					return r.GroupInfos[0]
+				}
+				return nil
+			})
 		if err != nil {
 			return nil, err
+		}
+		if groupInfo == nil {
+			return nil, servererrs.ErrGroupIDNotFound.WrapMsg(req.Conversation.GroupID)
 		}
 		if groupInfo.Status == constant.GroupStatusDismissed {
 			return nil, servererrs.ErrDismissedAlready.WrapMsg("group dismissed")
@@ -354,7 +364,15 @@ func (c *conversationServer) SetConversations(ctx context.Context, req *pbconver
 			needUpdateUsersList = append(needUpdateUsersList, userID)
 		}
 	}
+	if len(m) != 0 && len(needUpdateUsersList) != 0 {
+		if err := c.conversationDatabase.SetUsersConversationFieldTx(ctx, needUpdateUsersList, &conversation, m); err != nil {
+			return nil, err
+		}
 
+		for _, v := range needUpdateUsersList {
+			c.conversationNotificationSender.ConversationChangeNotification(ctx, v, []string{req.Conversation.ConversationID})
+		}
+	}
 	if req.Conversation.IsPrivateChat != nil && req.Conversation.ConversationType != constant.ReadGroupChatType {
 		var conversations []*dbModel.Conversation
 		for _, ownerUserID := range req.UserIDs {
@@ -371,16 +389,6 @@ func (c *conversationServer) SetConversations(ctx context.Context, req *pbconver
 		for _, userID := range req.UserIDs {
 			c.conversationNotificationSender.ConversationSetPrivateNotification(ctx, userID, req.Conversation.UserID,
 				req.Conversation.IsPrivateChat.Value, req.Conversation.ConversationID)
-		}
-	} else {
-		if len(m) != 0 && len(needUpdateUsersList) != 0 {
-			if err := c.conversationDatabase.SetUsersConversationFieldTx(ctx, needUpdateUsersList, &conversation, m); err != nil {
-				return nil, err
-			}
-
-			for _, v := range needUpdateUsersList {
-				c.conversationNotificationSender.ConversationChangeNotification(ctx, v, []string{req.Conversation.ConversationID})
-			}
 		}
 	}
 
@@ -436,14 +444,14 @@ func (c *conversationServer) CreateGroupChatConversations(ctx context.Context, r
 		return nil, err
 	}
 	conversationID := msgprocessor.GetConversationIDBySessionType(constant.ReadGroupChatType, req.GroupID)
-	if _, err := c.msgRpcClient.Client.SetUserConversationMaxSeq(ctx, &pbmsg.SetUserConversationMaxSeqReq{ConversationID: conversationID, OwnerUserID: req.UserIDs, MaxSeq: 0}); err != nil {
+	if _, err := pbmsg.SetUserConversationMaxSeqCaller.Invoke(ctx, &pbmsg.SetUserConversationMaxSeqReq{ConversationID: conversationID, OwnerUserID: req.UserIDs, MaxSeq: 0}); err != nil {
 		return nil, err
 	}
 	return &pbconversation.CreateGroupChatConversationsResp{}, nil
 }
 
 func (c *conversationServer) SetConversationMaxSeq(ctx context.Context, req *pbconversation.SetConversationMaxSeqReq) (*pbconversation.SetConversationMaxSeqResp, error) {
-	if _, err := c.msgRpcClient.Client.SetUserConversationMaxSeq(ctx, &pbmsg.SetUserConversationMaxSeqReq{ConversationID: req.ConversationID, OwnerUserID: req.OwnerUserID, MaxSeq: req.MaxSeq}); err != nil {
+	if _, err := pbmsg.SetUserConversationMaxSeqCaller.Invoke(ctx, &pbmsg.SetUserConversationMaxSeqReq{ConversationID: req.ConversationID, OwnerUserID: req.OwnerUserID, MaxSeq: req.MaxSeq}); err != nil {
 		return nil, err
 	}
 	if err := c.conversationDatabase.UpdateUsersConversationField(ctx, req.OwnerUserID, req.ConversationID,
@@ -457,7 +465,7 @@ func (c *conversationServer) SetConversationMaxSeq(ctx context.Context, req *pbc
 }
 
 func (c *conversationServer) SetConversationMinSeq(ctx context.Context, req *pbconversation.SetConversationMinSeqReq) (*pbconversation.SetConversationMinSeqResp, error) {
-	if _, err := c.msgRpcClient.Client.SetUserConversationMinSeq(ctx, &pbmsg.SetUserConversationMinSeqReq{ConversationID: req.ConversationID, OwnerUserID: req.OwnerUserID, MinSeq: req.MinSeq}); err != nil {
+	if _, err := pbmsg.SetUserConversationMinSeqCaller.Invoke(ctx, &pbmsg.SetUserConversationMinSeqReq{ConversationID: req.ConversationID, OwnerUserID: req.OwnerUserID, MinSeq: req.MinSeq}); err != nil {
 		return nil, err
 	}
 	if err := c.conversationDatabase.UpdateUsersConversationField(ctx, req.OwnerUserID, req.ConversationID,
@@ -567,7 +575,7 @@ func (c *conversationServer) getConversationInfo(
 		}
 	}
 	if len(sendIDs) != 0 {
-		sendInfos, err := c.user.GetUsersInfo(ctx, sendIDs)
+		sendInfos, err := rpcclient.GetUsersInfo(ctx, sendIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -576,7 +584,9 @@ func (c *conversationServer) getConversationInfo(
 		}
 	}
 	if len(groupIDs) != 0 {
-		groupInfos, err := c.groupRpcClient.GetGroupInfos(ctx, groupIDs, false)
+		groupInfos, err := rpccall.ExtractField(ctx, pbgroup.GetGroupsInfoCaller.Invoke,
+			&pbgroup.GetGroupsInfoReq{GroupIDs: groupIDs},
+			(*pbgroup.GetGroupsInfoResp).GetGroupInfos)
 		if err != nil {
 			return nil, err
 		}
@@ -752,4 +762,54 @@ func (c *conversationServer) GetPinnedConversationIDs(ctx context.Context, req *
 		return nil, err
 	}
 	return &pbconversation.GetPinnedConversationIDsResp{ConversationIDs: conversationIDs}, nil
+}
+
+func (c *conversationServer) ClearUserConversationMsg(ctx context.Context, req *pbconversation.ClearUserConversationMsgReq) (*pbconversation.ClearUserConversationMsgResp, error) {
+	conversations, err := c.conversationDatabase.FindRandConversation(ctx, req.Timestamp, int(req.Limit))
+	if err != nil {
+		return nil, err
+	}
+	latestMsgDestructTime := time.UnixMilli(req.Timestamp)
+	for i, conversation := range conversations {
+		if conversation.IsMsgDestruct == false || conversation.MsgDestructTime == 0 {
+			continue
+		}
+		rcpReq := &pbmsg.GetLastMessageSeqByTimeReq{ConversationID: conversation.ConversationID, Time: req.Timestamp - conversation.MsgDestructTime}
+		resp, err := pbmsg.GetLastMessageSeqByTime.Invoke(ctx, rcpReq)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Seq <= 0 {
+			log.ZDebug(ctx, "ClearUserConversationMsg GetLastMessageSeqByTime seq <= 0", "index", i, "conversationID", conversation.ConversationID, "ownerUserID", conversation.OwnerUserID, "msgDestructTime", conversation.MsgDestructTime, "seq", resp.Seq)
+			if err := c.setConversationMinSeqAndLatestMsgDestructTime(ctx, conversation.ConversationID, conversation.OwnerUserID, -1, latestMsgDestructTime); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		resp.Seq++
+		if err := c.setConversationMinSeqAndLatestMsgDestructTime(ctx, conversation.ConversationID, conversation.OwnerUserID, resp.Seq, latestMsgDestructTime); err != nil {
+			return nil, err
+		}
+		log.ZDebug(ctx, "ClearUserConversationMsg set min seq", "index", i, "conversationID", conversation.ConversationID, "ownerUserID", conversation.OwnerUserID, "seq", resp.Seq, "msgDestructTime", conversation.MsgDestructTime)
+	}
+	return &pbconversation.ClearUserConversationMsgResp{Count: int32(len(conversations))}, nil
+}
+
+func (c *conversationServer) setConversationMinSeqAndLatestMsgDestructTime(ctx context.Context, conversationID string, ownerUserID string, minSeq int64, latestMsgDestructTime time.Time) error {
+	update := map[string]any{
+		"latest_msg_destruct_time": latestMsgDestructTime,
+	}
+	if minSeq >= 0 {
+		req := &pbmsg.SetUserConversationMinSeqReq{ConversationID: conversationID, OwnerUserID: []string{ownerUserID}, MinSeq: minSeq}
+		if _, err := pbmsg.SetUserConversationMinSeqCaller.Invoke(ctx, req); err != nil {
+			return err
+		}
+		update["min_seq"] = minSeq
+	}
+
+	if err := c.conversationDatabase.UpdateUsersConversationField(ctx, []string{ownerUserID}, conversationID, update); err != nil {
+		return err
+	}
+	c.conversationNotificationSender.ConversationChangeNotification(ctx, ownerUserID, []string{conversationID})
+	return nil
 }
